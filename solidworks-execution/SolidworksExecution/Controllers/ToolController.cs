@@ -177,6 +177,15 @@ namespace SolidworksExecution.Controllers
                 case "modify_dimension":       return _service.ModifyDimension(request);
                 case "edit_feature":           return _service.EditFeature(request);
                 case "activate_document":      return _service.ActivateDocument(request);
+                case "capture_and_save_view":  return _service.CaptureAndSaveView(request);
+                case "open_new_assembly":      return _service.OpenNewAssembly(request);
+                case "insert_component":       return _service.InsertComponent(request);
+                case "add_mate":               return _service.AddMate(request);
+                case "replace_component":      return _service.ReplaceComponent(request);
+                case "set_component_suppression": return _service.SetComponentSuppression(request);
+                case "move_component":         return _service.MoveComponent(request);
+                case "rotate_component":       return _service.RotateComponent(request);
+                case "check_clearance":        return _service.CheckClearance(request);
                 default:                       return null;
             }
         }

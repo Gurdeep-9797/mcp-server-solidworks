@@ -460,6 +460,122 @@
         },
         "output": "→ see execution-response.json — CadState.ActiveDocument holds the now-active document title"
     },
+    "open_new_assembly": {
+        "description": "Opens a new blank assembly document in SolidWorks, establishing the active document context for subsequent assembly operations.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "template_path": "string (optional — full path to an assembly template .asmdot; uses the default assembly template if omitted)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "insert_component": {
+        "description": "Inserts a part or sub-assembly component into the active assembly document at given coordinates.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "file_path": "string (required — full path to the .sldprt or .sldasm file to insert)",
+                "x": "number (optional — X coordinate in meters, default 0.0)",
+                "y": "number (optional — Y coordinate in meters, default 0.0)",
+                "z": "number (optional — Z coordinate in meters, default 0.0)",
+                "fix_component": "boolean (optional — whether to fix the component in space upon insertion, default false)"
+            }
+        },
+        "output": "→ see execution-response.json — CadState.Features[0] holds the inserted component name"
+    },
+    "add_mate": {
+        "description": "Adds a mechanical or geometric mate between two entities in the active assembly.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "entity1_name": "string (required — name of first entity to mate, e.g. 'TopFace@Shelf-1@FridgeAssembly' or 'Plane1@Shelf-1@FridgeAssembly')",
+                "entity2_name": "string (required — name of second entity to mate)",
+                "mate_type": "string (optional — 'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent', 'distance', 'angle', 'gear', 'rack_pinion', 'screw', 'hinge', 'slot', 'width', 'lock', 'profile_center', 'symmetric'; default 'coincident')",
+                "align_type": "string (optional — 'aligned', 'anti_aligned', 'closest'; default 'aligned')",
+                "flip_dimension": "boolean (optional — whether to flip dimension direction, default false)",
+                "distance": "number (optional — distance value in meters for distance/limit mates, default 0.0)",
+                "dist_min_limit": "number (optional — minimum distance limit in meters, default 0.0)",
+                "dist_max_limit": "number (optional — maximum distance limit in meters, default 0.0)",
+                "angle": "number (optional — angle value in radians for angle mates, default 0.0)",
+                "angle_min_limit": "number (optional — minimum angle limit in radians, default 0.0)",
+                "angle_max_limit": "number (optional — maximum angle limit in radians, default 0.0)",
+                "gear_ratio_num": "number (optional — gear ratio numerator, default 1.0)",
+                "gear_ratio_den": "number (optional — gear ratio denominator, default 1.0)",
+                "reverse_gear": "boolean (optional — reverse gear rotation, default false)"
+            }
+        },
+        "output": "→ see execution-response.json — CadState.Features[0] holds the created mate name"
+    },
+    "replace_component": {
+        "description": "Replaces an existing component in the active assembly with a new part or assembly file.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "target_component": "string (required — name of the component to replace in the assembly)",
+                "new_file_path": "string (required — full path to the new component file)",
+                "replace_all_instances": "boolean (optional — whether to replace all instances of the target component, default false)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "set_component_suppression": {
+        "description": "Sets the suppression state of a component in the active assembly.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "component_name": "string (required — name of the component)",
+                "suppression_state": "string (optional — 'resolved', 'suppressed', or 'lightweight'; default 'resolved')"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "move_component": {
+        "description": "Translates a component by dx, dy, dz in assembly space.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "component_name": "string (required — name of the component to translate)",
+                "dx": "number (optional — X translation in meters, default 0.0)",
+                "dy": "number (optional — Y translation in meters, default 0.0)",
+                "dz": "number (optional — Z translation in meters, default 0.0)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "rotate_component": {
+        "description": "Rotates a component around X, Y, Z axes in assembly space.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "component_name": "string (required — name of the component to rotate)",
+                "rx": "number (optional — rotation around X axis in radians, default 0.0)",
+                "ry": "number (optional — rotation around Y axis in radians, default 0.0)",
+                "rz": "number (optional — rotation around Z axis in radians, default 0.0)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "check_clearance": {
+        "description": "Checks clearance and interference in the active assembly.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "component1_name": "string (optional — name of first component to check)",
+                "component2_name": "string (optional — name of second component to check)",
+                "min_required_clearance": "number (optional — minimum required clearance in meters, default 0.001)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
     "submit_feature_graph": {
         "description": "[EXPERIMENTAL / OPT-IN — P1.4/P1.7] Feature Graph IR + deterministic compiler path. NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter's pycompiler (solidworks-compiler/pycompiler) lowers a CAD-neutral Feature Graph IR into ordered calls to the EXISTING low-level tools (create_sketch / add_sketch_entity / extrude_feature / analyze_model) and resolves semantic refs (top_face/center) against live geometry. Gated: refuses unless the operator kill switch SOLIDPILOT_ENABLE_IR is on AND i_understand_this_is_experimental=true. Coexists with the low-level tools WITHOUT changing them. v0-exp vocabulary: box, sketch+extrude (boss/cut), hole-on-face (selector 'top', position 'center', depth 'through_all'). The adapter resyncs its local state_version from GET /state after a run (one submit performs many state-bumping sub-ops).",
         "input": {

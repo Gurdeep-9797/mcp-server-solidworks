@@ -997,6 +997,17 @@ def submit_feature_graph(
 
 
 # ---------------------------------------------------------------------------
+# Tool: capture_and_save_view
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def capture_and_save_view(file_path: str) -> str:
+    """Capture a screenshot of the active SolidWorks 3D viewport and save it to an image file (e.g. .png).
+    file_path: absolute path where the image should be saved.
+    Returns the saved file path and status."""
+    return _call("capture_and_save_view", {"file_path": file_path})
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

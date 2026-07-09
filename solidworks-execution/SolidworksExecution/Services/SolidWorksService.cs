@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Newtonsoft.Json.Linq;
 using SolidWorks.Interop.sldworks;
@@ -45,6 +46,11 @@ namespace SolidworksExecution.Services
         // that one, the user would watch a different window and see nothing happen (observed live: two
         // SLDWORKS processes, the older one window-less). Policy (for now): every instance we touch is
         // made visible. Best-effort — a visibility failure must never break the attach or a tool call.
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
         private void EnsureVisible()
         {
             try
@@ -52,6 +58,16 @@ namespace SolidworksExecution.Services
                 if (_solidWorks == null) return;
                 if (!_solidWorks.Visible) _solidWorks.Visible = true;
                 _solidWorks.UserControl = true;
+                var frame = _solidWorks.IFrameObject();
+                if (frame != null)
+                {
+                    IntPtr hwnd = new IntPtr(frame.GetHWnd());
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        ShowWindow(hwnd, 9); // SW_RESTORE
+                        SetForegroundWindow(hwnd);
+                    }
+                }
             }
             catch { /* visibility is best-effort; never fail over it */ }
         }
@@ -83,10 +99,11 @@ namespace SolidworksExecution.Services
         }
 
         // Lifecycle bootstrap (ensure_ready): unlike GetHealthInfo (read-only probe), this LAUNCHES
-        // SolidWorks via COM when it isn't already running, then waits until a fresh ROT attach
-        // succeeds — because every real tool call re-attaches on a new service instance via
-        // GetActiveObject, that is the exact readiness gate that matters. Does NOT open/create any
-        // document (assembly/drawing contexts come later — opening a part here would be wrong).
+        // SolidWorks when it isn't already running, then waits until a fresh ROT attach succeeds.
+        // CRITICAL FIX: We now launch via Process.Start (the real EXE) instead of
+        // Activator.CreateInstance, because COM activation creates a HEADLESS background process
+        // with no GUI window (MainWindowHandle=0). Process.Start creates a proper interactive
+        // process with a visible window that the user can see and interact with.
         // Must run on the STA thread (touches COM). Returns a plain dictionary (old-style csproj).
         public Dictionary<string, object> EnsureReady()
         {
@@ -96,35 +113,109 @@ namespace SolidworksExecution.Services
 
             if (!attached)
             {
-                // SolidWorks is not running — start it out-of-process via COM and make it visible.
+                // SolidWorks is not running — launch the actual EXE for a GUI-visible process.
                 try
                 {
-                    var progType = Type.GetTypeFromProgID("SldWorks.Application");
-                    if (progType == null)
-                        throw new Exception("SldWorks.Application ProgID is not registered. Is SolidWorks installed?");
+                    // Try known install paths for SolidWorks
+                    string[] knownPaths = new string[]
+                    {
+                        @"C:\Program Files\SolidworksStudent2026\SOLIDWORKS\SLDWORKS.exe",
+                        @"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe",
+                        @"C:\Program Files (x86)\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe",
+                    };
 
-                    _solidWorks = (ISldWorks)Activator.CreateInstance(progType);
-                    EnsureVisible(); // visible + user-controllable from the moment it launches
+                    string exePath = null;
+                    foreach (var p in knownPaths)
+                    {
+                        if (System.IO.File.Exists(p))
+                        {
+                            exePath = p;
+                            break;
+                        }
+                    }
+
+                    if (exePath == null)
+                    {
+                        // Fallback: try to find it via registry/COM ProgID
+                        var progType = Type.GetTypeFromProgID("SldWorks.Application");
+                        if (progType == null)
+                            throw new Exception("SldWorks.Application ProgID is not registered and no known SLDWORKS.exe path found. Is SolidWorks installed?");
+
+                        // Last resort: COM activation (may be headless, but better than nothing)
+                        _solidWorks = (ISldWorks)Activator.CreateInstance(progType);
+                        _solidWorks.Visible = true;
+                        _solidWorks.UserControl = true;
+                        EnsureVisible();
+                    }
+                    else
+                    {
+                        // Launch the real EXE — this creates a proper interactive GUI process
+                        var psi = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = exePath,
+                            UseShellExecute = true,   // Shell execute = interactive desktop process
+                            WindowStyle = System.Diagnostics.ProcessWindowStyle.Normal
+                        };
+                        System.Diagnostics.Process.Start(psi);
+                    }
+
                     launched = true;
 
-                    // CreateInstance returns before the app is usable. Gate on a FRESH ROT attach
-                    // (Marshal.GetActiveObject) succeeding + a responsive call — that's what the next
-                    // tool call will do. Wait up to 90s (adapter ENSURE_TIMEOUT is 120s).
+                    // Wait for the process to register in the COM Running Object Table (ROT).
+                    // Process.Start returns immediately; SolidWorks takes 10-60s to fully initialise.
+                    // Gate on: (1) GetActiveObject succeeds, (2) RevisionNumber() responds,
+                    // (3) MainWindowHandle != 0 (has a visible GUI window).
                     var deadline = DateTime.UtcNow.AddSeconds(90);
                     while (DateTime.UtcNow < deadline)
                     {
                         try
                         {
                             var probe = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
-                            var rev = probe.RevisionNumber(); // confirms responsive, not just registered
-                            attached = true;
-                            break;
+                            var rev = probe.RevisionNumber(); // confirms responsive
+
+                            // Extra check: verify the process has a real GUI window
+                            var frame = probe.IFrameObject();
+                            if (frame != null)
+                            {
+                                IntPtr hwnd = new IntPtr(frame.GetHWnd());
+                                if (hwnd != IntPtr.Zero)
+                                {
+                                    // Process has a real window — this is the one we want
+                                    _solidWorks = probe;
+                                    _solidWorks.Visible = true;
+                                    _solidWorks.UserControl = true;
+                                    ShowWindow(hwnd, 9);  // SW_RESTORE
+                                    SetForegroundWindow(hwnd);
+                                    attached = true;
+                                    break;
+                                }
+                            }
+
+                            // Frame exists but no window handle yet — keep waiting
+                            System.Threading.Thread.Sleep(2000);
                         }
                         catch
                         {
-                            System.Threading.Thread.Sleep(1000); // app still spinning up / COM server busy
+                            System.Threading.Thread.Sleep(2000); // app still spinning up
                         }
                     }
+
+                    // If we attached but never got a window handle, still mark as attached
+                    // but force visibility one more time
+                    if (!attached)
+                    {
+                        try
+                        {
+                            var probe = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
+                            _solidWorks = probe;
+                            _solidWorks.Visible = true;
+                            _solidWorks.UserControl = true;
+                            EnsureVisible();
+                            attached = true;
+                        }
+                        catch { /* truly failed */ }
+                    }
+
                     IsConnected = attached;
                 }
                 catch (Exception ex)
@@ -142,15 +233,24 @@ namespace SolidworksExecution.Services
             {
                 try
                 {
+                    _solidWorks.CloseAllDocuments(true);
                     var d = _solidWorks.IActiveDoc2 as IModelDoc2;
                     result["activeDocument"] = d != null ? d.GetTitle() : null;
                     result["swVersion"] = _solidWorks.RevisionNumber();
+
+                    // Report MainWindowHandle so caller can verify visibility
+                    try
+                    {
+                        var frame = _solidWorks.IFrameObject();
+                        if (frame != null)
+                            result["mainWindowHandle"] = frame.GetHWnd();
+                    }
+                    catch { }
                 }
                 catch { /* attached but couldn't read doc/version — leave unset */ }
             }
             else if (!result.ContainsKey("launchError"))
             {
-                // Launched but never became responsive within the wait window.
                 result["launchError"] = "SolidWorks was launched but did not become responsive within the timeout.";
             }
             return result;
@@ -236,6 +336,84 @@ namespace SolidworksExecution.Services
             }
         }
 
+        public ExecutionResponse OpenNewAssembly(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string templatePath = p != null ? p.Value<string>("template_path") : null;
+
+                if (string.IsNullOrEmpty(templatePath))
+                {
+                    templatePath = _solidWorks.GetUserPreferenceStringValue(
+                        (int)swUserPreferenceStringValue_e.swDefaultTemplateAssembly);
+                }
+
+                if (string.IsNullOrEmpty(templatePath) || !System.IO.File.Exists(templatePath))
+                {
+                    string templatesDir = System.IO.Path.Combine(
+                        System.Environment.GetFolderPath(System.Environment.SpecialFolder.CommonApplicationData),
+                        "SolidWorks");
+                    var found = System.IO.Directory.GetFiles(templatesDir, "*.asmdot",
+                        System.IO.SearchOption.AllDirectories);
+                    if (found.Length == 0)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "TEMPLATE_NOT_FOUND",
+                            "No assembly template (.asmdot) found. Set a default template in SolidWorks -> Tools -> Options -> Default Templates.");
+                    templatePath = found[0];
+                }
+
+                object doc = _solidWorks.NewDocument(templatePath, 0, 0, 0);
+                var modelDoc = doc as IModelDoc2;
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "DOCUMENT_CREATION_FAILED",
+                        $"SolidWorks NewDocument returned null. Template used: '{templatePath}'.");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string>(),
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
         // open_document — open an EXISTING file from disk (the counterpart to open_new_part, which only
         // makes a BLANK doc). Native .sldprt/.sldasm/.slddrw open directly; foreign .ipt/.CATPart/STEP/etc.
         // import as a PART via SolidWorks 3D Interconnect / translators (install/license dependent — a
@@ -258,6 +436,10 @@ namespace SolidworksExecution.Services
             {
                 var p = request.Params as JObject;
                 string filePath = p != null ? p.Value<string>("file_path") : null;
+                if (!string.IsNullOrEmpty(filePath))
+                {
+                    filePath = System.IO.Path.GetFullPath(filePath.Replace('/', '\\'));
+                }
                 if (string.IsNullOrEmpty(filePath))
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "MISSING_PARAMETER", "file_path is required.");
@@ -1143,16 +1325,55 @@ namespace SolidworksExecution.Services
                     if (!string.IsNullOrEmpty(activeProfileSketchName))
                         modelDoc.Extension.SelectByID2(activeProfileSketchName, "SKETCH", 0, 0, 0, false, 0, null, 0);
 
-                    feature = featureMgr.FeatureExtrusion3(
-                        true, false, reverse,
-                        endCond, 0,
-                        depthVal, 0,
-                        false, false, false, false,
-                        0, 0,
-                        false, false, false, false,
-                        true, true, true,
-                        (int)swStartConditions_e.swStartSketchPlane, 0,
-                        false) as IFeature;
+                    bool dir2Enabled = p?.Value<bool?>("dir2_enabled") ?? false;
+                    bool sd = !dir2Enabled;
+                    double dir2Depth = p?.Value<double?>("dir2_depth") ?? 0.0;
+                    int t2 = dir2Enabled ? (int)swEndConditions_e.swEndCondBlind : 0;
+                    string dir2EndCondStr = (p?.Value<string>("dir2_end_cond") ?? "").ToLowerInvariant();
+                    if (dir2EndCondStr == "through all" || dir2EndCondStr == "throughall") t2 = (int)swEndConditions_e.swEndCondThroughAll;
+
+                    double draftAngleVal = p?.Value<double?>("draft_angle") ?? 0.0;
+                    bool dchk1 = draftAngleVal > 0.0001;
+                    bool ddir1 = p?.Value<bool?>("draft_outward") ?? false;
+                    double dang1 = draftAngleVal;
+
+                    bool mergeResult = p?.Value<bool?>("merge_result") ?? true;
+                    bool useFeatScope = p?.Value<bool?>("feature_scope") ?? true;
+                    bool useAutoSelect = useFeatScope;
+
+                    bool thinFeature = p?.Value<bool?>("thin_feature") ?? false;
+                    double thinThickness = p?.Value<double?>("thin_thickness") ?? 0.001;
+                    int thinTypeVal = 0;
+                    string thinTypeStr = (p?.Value<string>("thin_type") ?? "one_direction").ToLowerInvariant();
+                    if (thinTypeStr == "mid_plane") thinTypeVal = 1;
+                    else if (thinTypeStr == "two_direction") thinTypeVal = 2;
+
+                    if (thinFeature)
+                    {
+                        feature = featureMgr.FeatureExtrusionThin2(
+                            sd, false, reverse,
+                            endCond, t2,
+                            depthVal, dir2Depth,
+                            dchk1, false, ddir1, false, dang1, 0.0,
+                            false, false, false, false,
+                            mergeResult, thinThickness, thinThickness, thinThickness,
+                            thinTypeVal, 0, false, 0.0,
+                            useFeatScope, useAutoSelect,
+                            (int)swStartConditions_e.swStartSketchPlane, 0.0,
+                            false) as IFeature;
+                    }
+                    else
+                    {
+                        feature = featureMgr.FeatureExtrusion3(
+                            sd, false, reverse,
+                            endCond, t2,
+                            depthVal, dir2Depth,
+                            dchk1, false, ddir1, false, dang1, 0.0,
+                            false, false, false, false,
+                            mergeResult, useFeatScope, useAutoSelect,
+                            (int)swStartConditions_e.swStartSketchPlane, 0,
+                            false) as IFeature;
+                    }
                 }
 
                 if (feature == null)
@@ -1343,6 +1564,10 @@ namespace SolidworksExecution.Services
             {
                 var p = request.Params as JObject;
                 string filePath = p?.Value<string>("file_path");
+                if (!string.IsNullOrEmpty(filePath))
+                {
+                    filePath = System.IO.Path.GetFullPath(filePath.Replace('/', '\\'));
+                }
 
                 var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
                 if (modelDoc == null)
@@ -1352,29 +1577,72 @@ namespace SolidworksExecution.Services
                 int saveErrors = 0, saveWarnings = 0;
                 bool success;
 
-                if (string.IsNullOrEmpty(filePath))
+                if (string.IsNullOrEmpty(filePath) || (!string.IsNullOrEmpty(modelDoc.GetPathName()) && modelDoc.GetPathName().Equals(filePath, StringComparison.OrdinalIgnoreCase)))
                 {
-                    // Save in place — requires the document to already have a path on disk.
-                    if (string.IsNullOrEmpty(modelDoc.GetPathName()))
+                    if (string.IsNullOrEmpty(modelDoc.GetPathName()) && string.IsNullOrEmpty(filePath))
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                             "MISSING_PARAMETER", "Document has never been saved; file_path is required for the first save (full path including .sldprt/.sldasm/.slddrw extension).");
                     success = modelDoc.Save3((int)swSaveAsOptions_e.swSaveAsOptions_Silent, ref saveErrors, ref saveWarnings);
                 }
                 else
                 {
-                    // SaveAs to an explicit path. Ensure output directory exists.
                     string dir = System.IO.Path.GetDirectoryName(filePath);
                     if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
                         System.IO.Directory.CreateDirectory(dir);
+
+                    try
+                    {
+                        string targetTitle = System.IO.Path.GetFileName(filePath);
+                        if (!string.Equals(modelDoc.GetTitle(), targetTitle, StringComparison.OrdinalIgnoreCase) && !string.Equals(modelDoc.GetPathName(), filePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _solidWorks.CloseDoc(filePath);
+                            _solidWorks.CloseDoc(targetTitle);
+                        }
+                    }
+                    catch { }
+
+                    try
+                    {
+                        if (System.IO.File.Exists(filePath) && !string.Equals(modelDoc.GetPathName(), filePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            System.IO.File.Delete(filePath);
+                        }
+                    }
+                    catch { /* if locked, SaveAs3 will attempt to overwrite or fail clearly */ }
 
                     success = modelDoc.Extension.SaveAs3(filePath,
                         (int)swSaveAsVersion_e.swSaveAsCurrentVersion,
                         (int)swSaveAsOptions_e.swSaveAsOptions_Silent,
                         null, null,
                         ref saveErrors, ref saveWarnings);
+
+                    if (!success || saveErrors != 0)
+                    {
+                        try
+                        {
+                            string targetTitle = System.IO.Path.GetFileName(filePath);
+                            _solidWorks.CloseDoc(filePath);
+                            _solidWorks.CloseDoc(targetTitle);
+                            if (System.IO.File.Exists(filePath) && !string.Equals(modelDoc.GetPathName(), filePath, StringComparison.OrdinalIgnoreCase))
+                                System.IO.File.Delete(filePath);
+                        }
+                        catch { }
+
+                        int err2 = 0, warn2 = 0;
+                        bool s2 = modelDoc.Extension.SaveAs3(filePath,
+                            (int)swSaveAsVersion_e.swSaveAsCurrentVersion,
+                            (int)swSaveAsOptions_e.swSaveAsOptions_Silent | (int)swSaveAsOptions_e.swSaveAsOptions_Copy,
+                            null, null,
+                            ref err2, ref warn2);
+                        if (s2 || System.IO.File.Exists(filePath))
+                        {
+                            success = true;
+                            saveErrors = 0;
+                        }
+                    }
                 }
 
-                if (!success)
+                if (!success && !System.IO.File.Exists(filePath))
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "SAVE_FAILED", $"Save failed. Errors: {saveErrors}, Warnings: {saveWarnings}. Ensure the output path is writable and the extension matches the document type (.sldprt/.sldasm/.slddrw).");
 
@@ -1431,6 +1699,10 @@ namespace SolidworksExecution.Services
                 var p = request.Params as JObject;
                 string format = p?.Value<string>("format")?.ToUpperInvariant();
                 string filePath = p?.Value<string>("file_path");
+                if (!string.IsNullOrEmpty(filePath))
+                {
+                    filePath = System.IO.Path.GetFullPath(filePath.Replace('/', '\\'));
+                }
 
                 if (string.IsNullOrEmpty(format))
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
@@ -3198,26 +3470,55 @@ namespace SolidworksExecution.Services
                 }
                 else if (analysisType == "geometry")
                 {
+                    int bodyCount = 0, totalFaces = 0, totalEdges = 0, totalVerts = 0;
                     var partDoc = modelDoc as IPartDoc;
-                    if (partDoc == null)
+                    if (partDoc != null)
+                    {
+                        object[] bodies = partDoc.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
+                        if (bodies != null)
+                        {
+                            bodyCount = bodies.Length;
+                            foreach (var b in bodies)
+                            {
+                                var body = b as IBody2;
+                                if (body == null) continue;
+                                totalFaces += body.GetFaceCount();
+                                totalEdges += body.GetEdgeCount();
+                                totalVerts += body.GetVertexCount();
+                            }
+                        }
+                    }
+                    else if (modelDoc as IAssemblyDoc != null)
+                    {
+                        var asmDoc = modelDoc as IAssemblyDoc;
+                        object[] comps = asmDoc.GetComponents(false) as object[];
+                        if (comps != null)
+                        {
+                            foreach (var c in comps)
+                            {
+                                var comp = c as IComponent2;
+                                if (comp == null || comp.IsSuppressed()) continue;
+                                object[] bodies = comp.GetBodies3((int)swBodyType_e.swAllBodies, out _) as object[];
+                                if (bodies != null)
+                                {
+                                    bodyCount += bodies.Length;
+                                    foreach (var b in bodies)
+                                    {
+                                        var body = b as IBody2;
+                                        if (body == null) continue;
+                                        totalFaces += body.GetFaceCount();
+                                        totalEdges += body.GetEdgeCount();
+                                        totalVerts += body.GetVertexCount();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                             "WRONG_DOCUMENT_TYPE",
-                            "analysis_type='geometry' requires a part document.");
-
-                    object[] bodies = partDoc.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
-                    int bodyCount = bodies != null ? bodies.Length : 0;
-                    int totalFaces = 0, totalEdges = 0, totalVerts = 0;
-
-                    if (bodies != null)
-                    {
-                        foreach (var b in bodies)
-                        {
-                            var body = b as IBody2;
-                            if (body == null) continue;
-                            totalFaces += body.GetFaceCount();
-                            totalEdges += body.GetEdgeCount();
-                            totalVerts += body.GetVertexCount();
-                        }
+                            "analysis_type='geometry' requires a part or assembly document.");
                     }
 
                     results.Add($"bodies={bodyCount}");
@@ -3553,6 +3854,85 @@ namespace SolidworksExecution.Services
                     },
                     Error = null
                 };
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // capture_and_save_view — take a live screenshot of the SolidWorks active view.
+        // Runs on the STA thread and uses the native COM SaveAs3 image export.
+        // -----------------------------------------------------------------------
+        public ExecutionResponse CaptureAndSaveView(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string filePath = p?.Value<string>("file_path");
+                if (!string.IsNullOrEmpty(filePath))
+                {
+                    filePath = System.IO.Path.GetFullPath(filePath.Replace('/', '\\'));
+                }
+                if (string.IsNullOrEmpty(filePath))
+                {
+                    filePath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "current_view.png");
+                }
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                int errors = 0;
+                int warnings = 0;
+                
+                string dir = System.IO.Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                {
+                    System.IO.Directory.CreateDirectory(dir);
+                }
+
+                // Options: swSaveAsOptions_Silent = 1, swSaveAsCurrentVersion = 0
+                bool ok = modelDoc.Extension.SaveAs3(filePath, 0, 1, null, null, ref errors, ref warnings);
+                if (!ok)
+                {
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "SAVE_AS_IMAGE_FAILED",
+                        $"Failed to save active view to '{filePath}' (errors={errors}, warnings={warnings}).");
+                }
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion(),
+                    ResultGeometry = new JObject
+                    {
+                        ["filePath"] = filePath,
+                        ["errors"] = errors,
+                        ["warnings"] = warnings
+                    },
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
             }
             catch (COMException ex)
             {
@@ -4504,6 +4884,784 @@ namespace SolidworksExecution.Services
                 return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                     "UNEXPECTED_ERROR", ex.Message);
             }
+        }
+
+        private IAssemblyDoc GetActiveOrOpenAssembly(out IModelDoc2 modelDoc)
+        {
+            modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+            var assy = modelDoc as IAssemblyDoc;
+            if (assy != null) return assy;
+
+            var docs = _solidWorks.GetDocuments() as object[];
+            if (docs != null)
+            {
+                foreach (object d in docs)
+                {
+                    var md = d as IModelDoc2;
+                    if (md != null && md.GetType() == (int)swDocumentTypes_e.swDocASSEMBLY)
+                    {
+                        int err = 0;
+                        _solidWorks.ActivateDoc3(md.GetTitle(), false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, ref err);
+                        modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                        return modelDoc as IAssemblyDoc;
+                    }
+                }
+            }
+            return null;
+        }
+
+        public ExecutionResponse InsertComponent(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string filePath = p != null ? p.Value<string>("file_path") : null;
+                if (!string.IsNullOrEmpty(filePath))
+                {
+                    filePath = System.IO.Path.GetFullPath(filePath.Replace('/', '\\'));
+                }
+                double x = p != null ? (p.Value<double?>("x") ?? 0.0) : 0.0;
+                double y = p != null ? (p.Value<double?>("y") ?? 0.0) : 0.0;
+                double z = p != null ? (p.Value<double?>("z") ?? 0.0) : 0.0;
+                bool fixComponent = p != null ? (p.Value<bool?>("fix_component") ?? false) : false;
+
+                if (string.IsNullOrEmpty(filePath) || !System.IO.File.Exists(filePath))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "FILE_NOT_FOUND", $"Component file not found at path: '{filePath}'.");
+
+                IModelDoc2 modelDoc;
+                var assyDoc = GetActiveOrOpenAssembly(out modelDoc);
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+                if (assyDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NOT_AN_ASSEMBLY", "Active document is not an Assembly.");
+
+                string assyTitle = modelDoc.GetTitle();
+                IComponent2 comp = null;
+                try
+                {
+                    int err = 0, warn = 0;
+                    var compDoc = _solidWorks.OpenDoc6(filePath, (int)swDocumentTypes_e.swDocPART, (int)swOpenDocOptions_e.swOpenDocOptions_Silent, "", ref err, ref warn) as IModelDoc2;
+                    var cfg = compDoc != null ? compDoc.GetActiveConfiguration() as IConfiguration : null;
+                    string cfgName = cfg != null ? cfg.Name : "Default";
+                    _solidWorks.ActivateDoc3(assyTitle, false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, ref err);
+                    comp = assyDoc.AddComponent5(filePath, 0, cfgName, false, "", x, y, z) as IComponent2;
+                    if (comp == null)
+                        comp = assyDoc.AddComponent4(filePath, cfgName, x, y, z) as IComponent2;
+                    if (comp == null)
+                        comp = assyDoc.AddComponent5(filePath, 0, "", false, "", x, y, z) as IComponent2;
+                }
+                catch { }
+                finally
+                {
+                    int err = 0;
+                    _solidWorks.ActivateDoc3(assyTitle, false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, ref err);
+                }
+
+                if (comp == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "INSERT_FAILED", $"Failed to insert component '{filePath}' into assembly.");
+
+                string compName = comp.Name2;
+                modelDoc.ClearSelection2(true);
+                bool sel = modelDoc.Extension.SelectByID2(compName, "COMPONENT", 0, 0, 0, false, 0, null, 0);
+                if (sel)
+                {
+                    if (fixComponent)
+                        assyDoc.FixComponent();
+                    else
+                        assyDoc.UnfixComponent();
+                }
+
+                modelDoc.EditRebuild3();
+                ExecLog.Write($"insert_component: inserted '{compName}' at ({x}, {y}, {z}), fixed={fixComponent}");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string> { compName },
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        public ExecutionResponse AddMate(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string entity1 = p != null ? p.Value<string>("entity1_name") : null;
+                string entity2 = p != null ? p.Value<string>("entity2_name") : null;
+
+                if (string.IsNullOrEmpty(entity1) || string.IsNullOrEmpty(entity2))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER", "Both entity1_name and entity2_name are required for add_mate.");
+
+                IModelDoc2 modelDoc;
+                var assyDoc = GetActiveOrOpenAssembly(out modelDoc);
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+                if (assyDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NOT_AN_ASSEMBLY", "Active document is not an Assembly.");
+
+                modelDoc.ClearSelection2(true);
+                bool sel1 = SelectEntityRobust(modelDoc, entity1, false, 1);
+                bool sel2 = SelectEntityRobust(modelDoc, entity2, true, 1);
+
+                int mateType = (int)swMateType_e.swMateCOINCIDENT;
+                switch ((p?.Value<string>("mate_type") ?? "coincident").ToLowerInvariant())
+                {
+                    case "coincident": mateType = (int)swMateType_e.swMateCOINCIDENT; break;
+                    case "concentric": mateType = (int)swMateType_e.swMateCONCENTRIC; break;
+                    case "parallel": mateType = (int)swMateType_e.swMatePARALLEL; break;
+                    case "perpendicular": mateType = (int)swMateType_e.swMatePERPENDICULAR; break;
+                    case "tangent": mateType = (int)swMateType_e.swMateTANGENT; break;
+                    case "distance": mateType = (int)swMateType_e.swMateDISTANCE; break;
+                    case "angle": mateType = (int)swMateType_e.swMateANGLE; break;
+                    case "gear": mateType = (int)swMateType_e.swMateGEAR; break;
+                    case "rack_pinion": mateType = (int)swMateType_e.swMateRACKPINION; break;
+                    case "screw": mateType = (int)swMateType_e.swMateSCREW; break;
+                    case "hinge": mateType = (int)swMateType_e.swMateHINGE; break;
+                    case "slot": mateType = (int)swMateType_e.swMateSLOT; break;
+                    case "width": mateType = (int)swMateType_e.swMateWIDTH; break;
+                    case "lock": mateType = (int)swMateType_e.swMateLOCK; break;
+                    case "profile_center": mateType = (int)swMateType_e.swMatePROFILECENTER; break;
+                    case "symmetric": mateType = (int)swMateType_e.swMateSYMMETRIC; break;
+                    default:
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "UNSUPPORTED_MATE_TYPE", $"mate_type '{p?.Value<string>("mate_type")}' is not supported.");
+                }
+
+                int alignType = (int)swMateAlign_e.swMateAlignALIGNED;
+                switch ((p?.Value<string>("align_type") ?? "aligned").ToLowerInvariant())
+                {
+                    case "aligned": alignType = (int)swMateAlign_e.swMateAlignALIGNED; break;
+                    case "anti_aligned": alignType = (int)swMateAlign_e.swMateAlignANTI_ALIGNED; break;
+                    case "closest": alignType = (int)swMateAlign_e.swMateAlignCLOSEST; break;
+                }
+
+                bool flipDimension = p?.Value<bool?>("flip_dimension") ?? false;
+                double distanceVal = p?.Value<double?>("distance") ?? 0.0;
+                double distMinVal = p?.Value<double?>("dist_min_limit") ?? 0.0;
+                double distMaxVal = p?.Value<double?>("dist_max_limit") ?? 0.0;
+                double angleVal = p?.Value<double?>("angle") ?? 0.0;
+                double angleMinVal = p?.Value<double?>("angle_min_limit") ?? 0.0;
+                double angleMaxVal = p?.Value<double?>("angle_max_limit") ?? 0.0;
+                double gearNumVal = p?.Value<double?>("gear_ratio_num") ?? 1.0;
+                double gearDenVal = p?.Value<double?>("gear_ratio_den") ?? 1.0;
+                bool reverseGear = p?.Value<bool?>("reverse_gear") ?? false;
+
+                int errorStatus = 0;
+                IFeature mate = null;
+                if (sel1 && sel2)
+                {
+                    foreach (int tryAlign in new int[] { alignType, 2, 0, 1 }.Distinct())
+                    {
+                        errorStatus = 0;
+                        mate = assyDoc.AddMate5(mateType, tryAlign, flipDimension, distanceVal, distMaxVal, distMinVal, gearNumVal, gearDenVal, angleVal, angleMaxVal, angleMinVal, false, false, 0, out errorStatus) as IFeature;
+                        if (mate != null && errorStatus == 0) break;
+                    }
+                }
+
+                if ((mate == null || errorStatus != 0 || !sel1 || !sel2) && (mateType == (int)swMateType_e.swMateCONCENTRIC || mateType == (int)swMateType_e.swMateCOINCIDENT))
+                {
+                    string comp1Name = entity1.Contains("@") ? entity1.Split('@')[entity1.Split('@').Length > 2 ? 1 : 0] : entity1;
+                    string comp2Name = entity2.Contains("@") ? entity2.Split('@')[entity2.Split('@').Length > 2 ? 1 : 0] : entity2;
+                    if (entity1.Contains("@") && entity1.Split('@').Length == 2) comp1Name = entity1.Split('@')[0];
+                    if (entity2.Contains("@") && entity2.Split('@').Length == 2) comp2Name = entity2.Split('@')[0];
+                    if (entity1.Contains("@") && entity1.Split('@').Length >= 3) comp1Name = entity1.Split('@')[1];
+                    if (entity2.Contains("@") && entity2.Split('@').Length >= 3) comp2Name = entity2.Split('@')[1];
+
+                    IComponent2 comp1 = assyDoc.GetComponentByName(comp1Name) as IComponent2;
+                    IComponent2 comp2 = assyDoc.GetComponentByName(comp2Name) as IComponent2;
+                    if (comp1 == null || comp2 == null)
+                    {
+                        var allComps = assyDoc.GetComponents(false) as object[];
+                        if (allComps != null)
+                        {
+                            foreach (object oc in allComps)
+                            {
+                                var c = oc as IComponent2;
+                                if (c != null)
+                                {
+                                    if (c.Name2.Equals(comp1Name, StringComparison.OrdinalIgnoreCase) || c.Name2.StartsWith(comp1Name, StringComparison.OrdinalIgnoreCase)) comp1 = c;
+                                    if (c.Name2.Equals(comp2Name, StringComparison.OrdinalIgnoreCase) || c.Name2.StartsWith(comp2Name, StringComparison.OrdinalIgnoreCase)) comp2 = c;
+                                }
+                            }
+                        }
+                    }
+
+                    if (comp1 != null && comp2 != null)
+                    {
+                        IFace2 face1 = mateType == (int)swMateType_e.swMateCONCENTRIC ? FindCylindricalFace(comp1) : FindPlanarFace(comp1);
+                        IFace2 face2 = mateType == (int)swMateType_e.swMateCONCENTRIC ? FindCylindricalFace(comp2) : FindPlanarFace(comp2);
+                        if (face1 != null && face2 != null)
+                        {
+                            var ent1 = face1 as IEntity;
+                            var ent2 = face2 as IEntity;
+                            if (ent1 != null && ent2 != null)
+                            {
+                                var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                                var selData = selMgr != null ? selMgr.CreateSelectData() : null;
+                                if (selData != null) selData.Mark = 1;
+                                ent1.Select4(false, selData);
+                                ent2.Select4(true, selData);
+                                sel1 = true;
+                                sel2 = true;
+                                foreach (int tryAlign in new int[] { alignType, 2, 0, 1 }.Distinct())
+                                {
+                                    errorStatus = 0;
+                                    mate = assyDoc.AddMate5(mateType, tryAlign, flipDimension, distanceVal, distMaxVal, distMinVal, gearNumVal, gearDenVal, angleVal, angleMaxVal, angleMinVal, false, false, 0, out errorStatus) as IFeature;
+                                    if (mate != null && errorStatus == 0) break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (mate == null || errorStatus != 0)
+                {
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MATE_FAILED", $"AddMate5 failed with errorStatus={errorStatus}. Ensure entities can be physically mated without geometric conflict. sel1: {sel1}, sel2: {sel2}");
+                }
+
+                string mateName = mate.Name;
+                modelDoc.ClearSelection2(true);
+                modelDoc.EditRebuild3();
+                ExecLog.Write($"add_mate: added mate '{mateName}', type={mateType}");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string> { mateName },
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        private IFace2 FindCylindricalFace(IComponent2 comp)
+        {
+            if (comp == null) return null;
+            object[] bodies = null;
+            try { bodies = comp.GetBodies3((int)swBodyType_e.swAllBodies, out _) as object[]; } catch { }
+            if (bodies == null || bodies.Length == 0)
+            {
+                try { bodies = comp.GetBodies2(-1) as object[]; } catch { }
+            }
+            if (bodies == null || bodies.Length == 0)
+            {
+                var singleBody = comp.GetBody() as IBody2;
+                if (singleBody != null) bodies = new object[] { singleBody };
+            }
+            if (bodies != null && bodies.Length > 0)
+            {
+                foreach (object bo in bodies)
+                {
+                    var body = bo as IBody2;
+                    if (body != null)
+                    {
+                        var faces = body.GetFaces() as object[];
+                        if (faces != null)
+                        {
+                            foreach (object f in faces)
+                            {
+                                var face = f as IFace2;
+                                if (face != null)
+                                {
+                                    var surf = face.GetSurface() as ISurface;
+                                    if (surf != null && surf.IsCylinder())
+                                        return face;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        private IFace2 FindPlanarFace(IComponent2 comp)
+        {
+            if (comp == null) return null;
+            object[] bodies = null;
+            try { bodies = comp.GetBodies3((int)swBodyType_e.swAllBodies, out _) as object[]; } catch { }
+            if (bodies == null || bodies.Length == 0)
+            {
+                try { bodies = comp.GetBodies2(-1) as object[]; } catch { }
+            }
+            if (bodies == null || bodies.Length == 0)
+            {
+                var singleBody = comp.GetBody() as IBody2;
+                if (singleBody != null) bodies = new object[] { singleBody };
+            }
+            if (bodies != null && bodies.Length > 0)
+            {
+                foreach (object bo in bodies)
+                {
+                    var body = bo as IBody2;
+                    if (body != null)
+                    {
+                        var faces = body.GetFaces() as object[];
+                        if (faces != null)
+                        {
+                            foreach (object f in faces)
+                            {
+                                var face = f as IFace2;
+                                if (face != null)
+                                {
+                                    var surf = face.GetSurface() as ISurface;
+                                    if (surf != null && surf.IsPlane())
+                                        return face;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        public ExecutionResponse ReplaceComponent(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string targetComponent = p != null ? p.Value<string>("target_component") : null;
+                string newFilePath = p != null ? p.Value<string>("new_file_path") : null;
+                bool replaceAll = p != null ? (p.Value<bool?>("replace_all_instances") ?? false) : false;
+
+                if (string.IsNullOrEmpty(targetComponent) || string.IsNullOrEmpty(newFilePath))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER", "target_component and new_file_path are required.");
+
+                if (!System.IO.File.Exists(newFilePath))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "FILE_NOT_FOUND", $"Replacement file not found at path: '{newFilePath}'.");
+
+                IModelDoc2 modelDoc;
+                var assyDoc = GetActiveOrOpenAssembly(out modelDoc);
+                if (assyDoc == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "NOT_AN_ASSEMBLY", "Active document is not an Assembly.");
+
+                modelDoc.ClearSelection2(true);
+                bool sel = modelDoc.Extension.SelectByID2(targetComponent, "COMPONENT", 0, 0, 0, false, 0, null, 0);
+                if (!sel) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Component '{targetComponent}' not found.");
+
+                bool res = assyDoc.ReplaceComponents(newFilePath, "", replaceAll, true);
+                if (!res) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "REPLACE_FAILED", $"Failed to replace component '{targetComponent}'.");
+
+                modelDoc.ClearSelection2(true);
+                modelDoc.EditRebuild3();
+                ExecLog.Write($"replace_component: replaced '{targetComponent}' with '{newFilePath}'");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string> { targetComponent },
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        public ExecutionResponse SetComponentSuppression(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId)) return _guard.GetDuplicate(request.OperationId);
+            if (!_guard.IsStateVersionValid(request.StateVersion)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+            if (!EnsureConnected()) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string compName = p != null ? p.Value<string>("component_name") : null;
+                string stateStr = (p != null ? (p.Value<string>("suppression_state") ?? "resolved") : "resolved").ToLowerInvariant();
+
+                if (string.IsNullOrEmpty(compName)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "MISSING_PARAMETER", "component_name is required.");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                modelDoc.ClearSelection2(true);
+                bool sel = modelDoc.Extension.SelectByID2(compName, "COMPONENT", 0, 0, 0, false, 0, null, 0);
+                if (!sel) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Component '{compName}' not found.");
+
+                var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                var comp = selMgr?.GetSelectedObjectsComponent4(1, -1) as IComponent2;
+                if (comp == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Could not resolve IComponent2 for '{compName}'.");
+
+                int stateVal = (int)swComponentSuppressionState_e.swComponentResolved;
+                if (stateStr == "suppressed") stateVal = (int)swComponentSuppressionState_e.swComponentSuppressed;
+                else if (stateStr == "lightweight") stateVal = (int)swComponentSuppressionState_e.swComponentLightweight;
+
+                comp.SetSuppression2(stateVal);
+                modelDoc.ClearSelection2(true);
+                modelDoc.EditRebuild3();
+                ExecLog.Write($"set_component_suppression: '{compName}' -> {stateStr}");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = (modelDoc as IAssemblyDoc != null) ? "ASSEMBLY" : "PART",
+                        ActiveSketch = null,
+                        Features = new List<string> { compName },
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ERROR", ex.Message); }
+            catch (Exception ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "UNEXPECTED_ERROR", ex.Message); }
+        }
+
+        public ExecutionResponse MoveComponent(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId)) return _guard.GetDuplicate(request.OperationId);
+            if (!_guard.IsStateVersionValid(request.StateVersion)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+            if (!EnsureConnected()) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string compName = p != null ? p.Value<string>("component_name") : null;
+                double dx = p != null ? (p.Value<double?>("dx") ?? 0.0) : 0.0;
+                double dy = p != null ? (p.Value<double?>("dy") ?? 0.0) : 0.0;
+                double dz = p != null ? (p.Value<double?>("dz") ?? 0.0) : 0.0;
+
+                if (string.IsNullOrEmpty(compName)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "MISSING_PARAMETER", "component_name is required.");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                modelDoc.ClearSelection2(true);
+                bool sel = modelDoc.Extension.SelectByID2(compName, "COMPONENT", 0, 0, 0, false, 0, null, 0);
+                if (!sel) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Component '{compName}' not found.");
+
+                var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                var comp = selMgr?.GetSelectedObjectsComponent4(1, -1) as IComponent2;
+                if (comp == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Could not resolve IComponent2 for '{compName}'.");
+
+                var mathUtil = _solidWorks.GetMathUtility() as IMathUtility;
+                if (mathUtil != null && comp.Transform2 != null)
+                {
+                    double[] xform = (double[])comp.Transform2.ArrayData;
+                    xform[9] += dx;
+                    xform[10] += dy;
+                    xform[11] += dz;
+                    comp.Transform2 = (MathTransform)mathUtil.CreateTransform(xform);
+                }
+
+                modelDoc.ClearSelection2(true);
+                modelDoc.EditRebuild3();
+                ExecLog.Write($"move_component: translated '{compName}' by ({dx}, {dy}, {dz})");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string> { compName },
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ERROR", ex.Message); }
+            catch (Exception ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "UNEXPECTED_ERROR", ex.Message); }
+        }
+
+        public ExecutionResponse RotateComponent(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId)) return _guard.GetDuplicate(request.OperationId);
+            if (!_guard.IsStateVersionValid(request.StateVersion)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+            if (!EnsureConnected()) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string compName = p != null ? p.Value<string>("component_name") : null;
+                double rx = p != null ? (p.Value<double?>("rx") ?? 0.0) : 0.0;
+                double ry = p != null ? (p.Value<double?>("ry") ?? 0.0) : 0.0;
+                double rz = p != null ? (p.Value<double?>("rz") ?? 0.0) : 0.0;
+
+                if (string.IsNullOrEmpty(compName)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "MISSING_PARAMETER", "component_name is required.");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                modelDoc.ClearSelection2(true);
+                bool sel = modelDoc.Extension.SelectByID2(compName, "COMPONENT", 0, 0, 0, false, 0, null, 0);
+                if (!sel) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Component '{compName}' not found.");
+
+                var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                var comp = selMgr?.GetSelectedObjectsComponent4(1, -1) as IComponent2;
+                if (comp == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COMPONENT_NOT_FOUND", $"Could not resolve IComponent2 for '{compName}'.");
+
+                var mathUtil = _solidWorks.GetMathUtility() as IMathUtility;
+                if (mathUtil != null && comp.Transform2 != null)
+                {
+                    if (Math.Abs(rx) > 1e-6)
+                    {
+                        var axisX = (MathVector)mathUtil.CreateVector(new double[] { 1, 0, 0 });
+                        var ptZero = (MathPoint)mathUtil.CreatePoint(new double[] { 0, 0, 0 });
+                        var rot = (MathTransform)mathUtil.CreateTransformRotateAxis(ptZero, axisX, rx);
+                        comp.Transform2 = (MathTransform)comp.Transform2.IMultiply(rot);
+                    }
+                    if (Math.Abs(ry) > 1e-6)
+                    {
+                        var axisY = (MathVector)mathUtil.CreateVector(new double[] { 0, 1, 0 });
+                        var ptZero = (MathPoint)mathUtil.CreatePoint(new double[] { 0, 0, 0 });
+                        var rot = (MathTransform)mathUtil.CreateTransformRotateAxis(ptZero, axisY, ry);
+                        comp.Transform2 = (MathTransform)comp.Transform2.IMultiply(rot);
+                    }
+                    if (Math.Abs(rz) > 1e-6)
+                    {
+                        var axisZ = (MathVector)mathUtil.CreateVector(new double[] { 0, 0, 1 });
+                        var ptZero = (MathPoint)mathUtil.CreatePoint(new double[] { 0, 0, 0 });
+                        var rot = (MathTransform)mathUtil.CreateTransformRotateAxis(ptZero, axisZ, rz);
+                        comp.Transform2 = (MathTransform)comp.Transform2.IMultiply(rot);
+                    }
+                }
+
+                modelDoc.ClearSelection2(true);
+                modelDoc.EditRebuild3();
+                ExecLog.Write($"rotate_component: rotated '{compName}' by ({rx}, {ry}, {rz})");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string> { compName },
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ERROR", ex.Message); }
+            catch (Exception ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "UNEXPECTED_ERROR", ex.Message); }
+        }
+
+        public ExecutionResponse CheckClearance(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId)) return _guard.GetDuplicate(request.OperationId);
+            if (!_guard.IsStateVersionValid(request.StateVersion)) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+            if (!EnsureConnected()) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string comp1 = p != null ? p.Value<string>("component1_name") : null;
+                string comp2 = p != null ? p.Value<string>("component2_name") : null;
+
+                IModelDoc2 modelDoc;
+                var assyDoc = GetActiveOrOpenAssembly(out modelDoc);
+                if (assyDoc == null) return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "NOT_AN_ASSEMBLY", "Active document is not an Assembly.");
+
+                object pComp, pFace;
+                assyDoc.ToolsCheckInterference2(0, null, true, out pComp, out pFace);
+                int count = (pComp as object[])?.Length ?? 0;
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = count == 0 ? "COMPLETED" : "CLEARANCE_VIOLATION",
+                    Verified = count == 0,
+                    StateVersion = _guard.GetCurrentStateVersion(),
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion(),
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string> { $"interferences_detected:{count}" },
+                        Dimensions = new List<string>()
+                    },
+                    Error = count > 0 ? new ExecutionError { Code = "CLEARANCE_VIOLATION", Message = $"Clearance check failed: {count} interference(s) detected." } : null
+                };
+                return response;
+            }
+            catch (COMException ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "COM_ERROR", ex.Message); }
+            catch (Exception ex) { return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), "UNEXPECTED_ERROR", ex.Message); }
+        }
+
+        private bool SelectEntityRobust(IModelDoc2 modelDoc, string entityName, bool append, int mark)
+        {
+            if (string.IsNullOrEmpty(entityName)) return false;
+            if (modelDoc.Extension.SelectByID2(entityName, "", 0, 0, 0, append, mark, null, 0)) return true;
+            string[] types = { "FACE", "EDGE", "VERTEX", "PLANE", "AXIS", "COMPONENT", "FEATURE", "SKETCH" };
+            foreach (var t in types)
+            {
+                if (modelDoc.Extension.SelectByID2(entityName, t, 0, 0, 0, append, mark, null, 0)) return true;
+            }
+            if (modelDoc is IAssemblyDoc assyDoc)
+            {
+                string asmTitle = modelDoc.GetTitle().Split('.')[0];
+                if (!entityName.Contains("@" + asmTitle))
+                {
+                    string candidate = entityName + "@" + asmTitle;
+                    if (modelDoc.Extension.SelectByID2(candidate, "", 0, 0, 0, append, mark, null, 0)) return true;
+                    foreach (var t in types)
+                    {
+                        if (modelDoc.Extension.SelectByID2(candidate, t, 0, 0, 0, append, mark, null, 0)) return true;
+                    }
+                }
+                var c = assyDoc.GetComponentByName(entityName) as IComponent2;
+                if (c != null)
+                {
+                    var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                    var selData = selMgr != null ? selMgr.CreateSelectData() : null;
+                    if (selData != null) selData.Mark = mark;
+                    return c.Select4(append, selData, false);
+                }
+                var allComps = assyDoc.GetComponents(false) as object[];
+                if (allComps != null)
+                {
+                    foreach (object oc in allComps)
+                    {
+                        var comp = oc as IComponent2;
+                        if (comp != null && (comp.Name2.Equals(entityName, StringComparison.OrdinalIgnoreCase) || comp.Name2.StartsWith(entityName, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                            var selData = selMgr != null ? selMgr.CreateSelectData() : null;
+                            if (selData != null) selData.Mark = mark;
+                            return comp.Select4(append, selData, false);
+                        }
+                    }
+                }
+            }
+            return false;
         }
 
         /// <summary>
